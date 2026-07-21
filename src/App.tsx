@@ -1,16 +1,9 @@
 import { useState, useRef, useEffect, useCallback, type DragEvent, type ChangeEvent } from 'react'
-import * as pdfjsLib from 'pdfjs-dist'
-
-pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
-  'pdfjs-dist/build/pdf.worker.min.mjs',
-  import.meta.url
-).toString()
 
 interface UploadedDoc {
   id: string
   name: string
   size: number
-  text: string
   pages: number
 }
 
@@ -22,18 +15,27 @@ interface Message {
 }
 
 async function uploadPDFToBackend(file: File): Promise<{ id: string; filename: string; pages: number; size: number }> {
+  console.log('Iniciando subida de archivo:', file.name)
   const formData = new FormData()
   formData.append('file', file)
-  const response = await fetch('http://localhost:8000/api/upload', {
-    method: 'POST',
-    body: formData,
-  })
-  if (!response.ok) {
-    const err = await response.json().catch(() => ({}))
-    throw new Error(err.detail || 'Error al subir el archivo')
+  try {
+    const response = await fetch('http://localhost:8000/api/upload', {
+      method: 'POST',
+      body: formData,
+    })
+    console.log('Respuesta del servidor recibida, status:', response.status)
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({}))
+      console.error('Error en respuesta del servidor:', err)
+      throw new Error(err.detail || 'Error al subir el archivo')
+    }
+    const data = await response.json()
+    console.log('Datos del documento parseados:', data)
+    return data.document
+  } catch (error) {
+    console.error('Error en fetch de subida:', error)
+    throw error
   }
-  const data = await response.json()
-  return data.document
 }
 
 async function askRAGBackend(question: string): Promise<{ answer: string; sources: { document: string; page: number }[] }> {
@@ -107,10 +109,6 @@ function TypingDots() {
 }
 
 export default function App() {
-  const [apiKey, setApiKey] = useState('')
-  const [apiKeyInput, setApiKeyInput] = useState('')
-  const [apiKeySet, setApiKeySet] = useState(false)
-
   const [docs, setDocs] = useState<UploadedDoc[]>([])
   const [uploading, setUploading] = useState(false)
   const [uploadError, setUploadError] = useState('')
@@ -129,8 +127,31 @@ export default function App() {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
 
+  // Cargar documentos existentes al iniciar la app
+  useEffect(() => {
+    async function fetchDocuments() {
+      try {
+        const response = await fetch('http://localhost:8000/api/documents')
+        const data = await response.json()
+        if (data.success) {
+          setDocs(data.documents.map((d: any) => ({
+            id: d.id,
+            name: d.filename,
+            size: d.file_size,
+            pages: d.page_count
+          })))
+        }
+      } catch (e) {
+        console.error('Error al cargar documentos iniciales:', e)
+      }
+    }
+    fetchDocuments()
+  }, [])
+
   const processFiles = useCallback(async (files: File[]) => {
+    console.log('processFiles llamada con archivos:', files)
     const pdfs = files.filter((f) => f.type === 'application/pdf' || f.name.endsWith('.pdf'))
+    console.log('PDFs filtrados:', pdfs)
     if (!pdfs.length) {
       setUploadError('Solo se aceptan archivos PDF.')
       return
@@ -139,26 +160,30 @@ export default function App() {
     setUploadError('')
     for (const file of pdfs) {
       try {
-        const { text, pages } = await extractPDFText(file)
+        const doc = await uploadPDFToBackend(file)
+        console.log('Documento recibido del backend:', doc)
         setDocs((prev) => [
           ...prev,
           {
-            id: crypto.randomUUID(),
-            name: file.name,
-            size: file.size,
-            text,
-            pages,
+            id: doc.id,
+            name: doc.filename,
+            size: doc.size,
+            pages: doc.pages,
           },
         ])
-      } catch {
-        setUploadError(`No se pudo leer "${file.name}".`)
+      } catch (e: any) {
+        setUploadError(`No se pudo subir "${file.name}": ${e.message}`)
       }
     }
     setUploading(false)
   }, [])
 
   const handleFileChange = (e: ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files) processFiles(Array.from(e.target.files))
+    console.log('handleFileChange evento disparado')
+    if (e.target.files) {
+      console.log('Archivos detectados en input:', e.target.files)
+      processFiles(Array.from(e.target.files))
+    }
     e.target.value = ''
   }
 
@@ -168,8 +193,13 @@ export default function App() {
     processFiles(Array.from(e.dataTransfer.files))
   }
 
-  const removeDoc = (id: string) => {
-    setDocs((prev) => prev.filter((d) => d.id !== id))
+  const removeDoc = async (id: string) => {
+    try {
+      await deletePDFFromBackend(id)
+      setDocs((prev) => prev.filter((d) => d.id !== id))
+    } catch {
+      setUploadError('Error al eliminar el documento.')
+    }
   }
 
   const handleSend = async () => {
@@ -177,10 +207,6 @@ export default function App() {
     if (!q || sending) return
     if (!docs.length) {
       setChatError('Sube al menos un documento antes de hacer preguntas.')
-      return
-    }
-    if (!apiKey) {
-      setChatError('Ingresa tu API key de Anthropic primero.')
       return
     }
 
@@ -192,9 +218,10 @@ export default function App() {
     setSending(true)
 
     try {
-      const answer = await askClaude(q, docs, apiKey)
+      const response = await askRAGBackend(q)
+      const formattedAnswer = `${response.answer}\n\n${response.sources.length > 0 ? 'Fuentes:\n' + response.sources.map(s => `- ${s.document} (pág. ${s.page})`).join('\n') : ''}`
       setMessages((prev) =>
-        prev.map((m) => (m.loading ? { ...m, content: answer, loading: false } : m))
+        prev.map((m) => (m.loading ? { ...m, content: formattedAnswer, loading: false } : m))
       )
     } catch (err: any) {
       setMessages((prev) =>
@@ -270,87 +297,6 @@ export default function App() {
         </span>
 
         <div style={{ flex: 1 }} />
-
-        {/* API Key area in header */}
-        {!apiKeySet ? (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <input
-              type="password"
-              placeholder="Anthropic API Key"
-              value={apiKeyInput}
-              onChange={(e) => setApiKeyInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && apiKeyInput.trim()) {
-                  setApiKey(apiKeyInput.trim())
-                  setApiKeySet(true)
-                }
-              }}
-              style={{
-                background: 'var(--surface-2)',
-                border: '1px solid var(--border-strong)',
-                borderRadius: 7,
-                padding: '6px 12px',
-                color: 'var(--text)',
-                fontSize: 13,
-                outline: 'none',
-                width: 220,
-                fontFamily: 'JetBrains Mono',
-              }}
-            />
-            <button
-              onClick={() => {
-                if (apiKeyInput.trim()) {
-                  setApiKey(apiKeyInput.trim())
-                  setApiKeySet(true)
-                }
-              }}
-              style={{
-                background: 'var(--accent)',
-                border: 'none',
-                borderRadius: 7,
-                padding: '6px 14px',
-                color: '#fff',
-                fontSize: 13,
-                fontWeight: 600,
-                cursor: 'pointer',
-                fontFamily: 'Plus Jakarta Sans',
-              }}
-            >
-              Guardar
-            </button>
-          </div>
-        ) : (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <span
-              style={{
-                width: 7,
-                height: 7,
-                borderRadius: '50%',
-                background: 'var(--success)',
-                display: 'inline-block',
-              }}
-            />
-            <span style={{ fontSize: 12, color: 'var(--text-dim)' }}>API Key configurada</span>
-            <button
-              onClick={() => {
-                setApiKey('')
-                setApiKeyInput('')
-                setApiKeySet(false)
-              }}
-              style={{
-                background: 'transparent',
-                border: '1px solid var(--border)',
-                borderRadius: 6,
-                padding: '3px 8px',
-                color: 'var(--text-muted)',
-                fontSize: 11,
-                cursor: 'pointer',
-              }}
-            >
-              Cambiar
-            </button>
-          </div>
-        )}
       </header>
 
       {/* Body */}
@@ -556,19 +502,6 @@ export default function App() {
                     Sube uno o más PDFs y el modelo responderá basándose exclusivamente en su contenido.
                   </p>
                 </div>
-                {!apiKeySet && (
-                  <div style={{
-                    background: 'rgba(245,158,11,0.08)',
-                    border: '1px solid rgba(245,158,11,0.2)',
-                    borderRadius: 9,
-                    padding: '10px 16px',
-                    maxWidth: 340,
-                  }}>
-                    <p style={{ fontSize: 12, color: 'var(--warning)', margin: 0, lineHeight: 1.5 }}>
-                      Ingresa tu API Key de Anthropic en la barra superior para comenzar.
-                    </p>
-                  </div>
-                )}
               </div>
             ) : (
               <div style={{ maxWidth: 760, margin: '0 auto', padding: '0 24px', display: 'flex', flexDirection: 'column', gap: 20 }}>
@@ -655,7 +588,7 @@ export default function App() {
                 onChange={(e) => { setInput(e.target.value); adjustTextarea() }}
                 onKeyDown={handleKeyDown}
                 placeholder={docs.length === 0 ? 'Sube un documento para comenzar...' : 'Escribe tu pregunta sobre los documentos...'}
-                disabled={!apiKeySet || docs.length === 0 || sending}
+                disabled={docs.length === 0 || sending}
                 rows={1}
                 style={{
                   flex: 1,
@@ -670,19 +603,19 @@ export default function App() {
                   maxHeight: 160,
                   overflowY: 'auto',
                   padding: 0,
-                  opacity: (!apiKeySet || docs.length === 0) ? 0.5 : 1,
+                  opacity: (docs.length === 0) ? 0.5 : 1,
                 }}
               />
               <button
                 onClick={handleSend}
-                disabled={!input.trim() || sending || !apiKeySet || docs.length === 0}
+                disabled={!input.trim() || sending || docs.length === 0}
                 style={{
                   width: 34,
                   height: 34,
                   borderRadius: 8,
-                  background: input.trim() && !sending && apiKeySet && docs.length > 0 ? 'var(--accent)' : 'var(--surface)',
+                  background: input.trim() && !sending && docs.length > 0 ? 'var(--accent)' : 'var(--surface)',
                   border: '1px solid var(--border-strong)',
-                  cursor: input.trim() && !sending && apiKeySet && docs.length > 0 ? 'pointer' : 'not-allowed',
+                  cursor: input.trim() && !sending && docs.length > 0 ? 'pointer' : 'not-allowed',
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'center',
