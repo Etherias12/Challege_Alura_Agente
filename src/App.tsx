@@ -21,58 +21,37 @@ interface Message {
   loading?: boolean
 }
 
-async function extractPDFText(file: File): Promise<{ text: string; pages: number }> {
-  const arrayBuffer = await file.arrayBuffer()
-  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise
-  let text = ''
-  for (let i = 1; i <= pdf.numPages; i++) {
-    const page = await pdf.getPage(i)
-    const content = await page.getTextContent()
-    const pageText = content.items.map((item: any) => item.str).join(' ')
-    text += pageText + '\n'
-  }
-  return { text, pages: pdf.numPages }
-}
-
-async function askClaude(question: string, docs: UploadedDoc[], apiKey: string): Promise<string> {
-  const context = docs
-    .map((d) => `=== Documento: ${d.name} ===\n${d.text.slice(0, 60000)}`)
-    .join('\n\n')
-
-  const systemPrompt = `Eres un asistente que SOLO responde preguntas basadas en los documentos proporcionados por el usuario.
-
-REGLAS ESTRICTAS:
-1. Responde ÚNICAMENTE con información que esté explícitamente en los documentos adjuntos.
-2. Si la pregunta no puede responderse con la información de los documentos, responde exactamente: "Esa información no se encuentra en los documentos proporcionados."
-3. Cuando respondas, cita qué documento contiene la información.
-4. No uses conocimiento externo ni hagas suposiciones.
-
-DOCUMENTOS DISPONIBLES:
-${context}`
-
-  const response = await fetch('https://api.anthropic.com/v1/messages', {
+async function uploadPDFToBackend(file: File): Promise<{ id: string; filename: string; pages: number; size: number }> {
+  const formData = new FormData()
+  formData.append('file', file)
+  const response = await fetch('http://localhost:8000/api/upload', {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': apiKey,
-      'anthropic-version': '2023-06-01',
-      'anthropic-dangerous-direct-browser-access': 'true',
-    },
-    body: JSON.stringify({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 1024,
-      system: systemPrompt,
-      messages: [{ role: 'user', content: question }],
-    }),
+    body: formData,
   })
-
   if (!response.ok) {
     const err = await response.json().catch(() => ({}))
-    throw new Error((err as any)?.error?.message || `Error ${response.status}`)
+    throw new Error(err.detail || 'Error al subir el archivo')
   }
-
   const data = await response.json()
-  return data.content[0].text
+  return data.document
+}
+
+async function askRAGBackend(question: string): Promise<{ answer: string; sources: { document: string; page: number }[] }> {
+  const response = await fetch('http://localhost:8000/api/ask', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ question }),
+  })
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}))
+    throw new Error(err.detail || 'Error en la consulta')
+  }
+  return response.json()
+}
+
+async function deletePDFFromBackend(id: string): Promise<void> {
+  const response = await fetch(`http://localhost:8000/api/documents/${id}`, { method: 'DELETE' })
+  if (!response.ok) throw new Error('Error al eliminar')
 }
 
 function formatSize(bytes: number) {
